@@ -1,0 +1,131 @@
+// Mouse debug: raycast to ground, click to place, WASD/Arrows to move.
+// Uses AssetContainer.instantiateModelsToScene so GLBs with TransformNode roots work.
+
+var createScene = async function () {
+  const scene = new BABYLON.Scene(engine);
+  scene.clearColor = new BABYLON.Color4(0.07,0.08,0.13,1);
+
+  // Camera & lights
+  const camera = new BABYLON.ArcRotateCamera("cam", Math.PI*0.9, Math.PI*0.6, 3.0, BABYLON.Vector3.Zero(), scene);
+  camera.attachControl(canvas, true);
+  camera.minZ = 0.01;
+  new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0,1,0), scene).intensity = 1.0;
+  new BABYLON.DirectionalLight("dir", new BABYLON.Vector3(-0.5,-1,-0.5), scene).intensity = 0.6;
+
+  // Ground
+  const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 20, height: 20 }, scene);
+  const gm = new BABYLON.StandardMaterial("gm", scene);
+  gm.diffuseColor = new BABYLON.Color3(0.2,0.22,0.3);
+  ground.material = gm;
+
+  // Reticle (the silver ring you saw)
+  const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", { thickness: 0.01, diameter: 0.2, tessellation: 48 }, scene);
+  reticle.rotation.x = Math.PI/2; reticle.isVisible = false; reticle.isPickable = false;
+
+  // UI hint
+  const adt = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("ui", true, scene);
+  const hint = new BABYLON.GUI.TextBlock();
+  hint.text = "Move mouse to aim • Left-click to place • WASD/Arrows to move last object";
+  hint.color = "#eaeefb"; hint.fontSize = 18; hint.top = "10px";
+  adt.addControl(hint);
+
+  const MODEL_URL = "https://cdn.jsdelivr.net/gh/ChunTungZhuangLeo/greenHack@main/wilson_blade_team_tennis_racket.glb";
+
+  // --- Load GLB into an AssetContainer (robust) ---
+  let container;
+  try {
+    container = await BABYLON.SceneLoader.LoadAssetContainerAsync("", MODEL_URL, scene);
+  } catch (e) {
+    console.error(e);
+    hint.text = "Failed to load GLB. Check URL/CORS.";
+    return scene;
+  }
+
+  // Helper: frame camera around a node group
+  function frameNodes(nodes){
+    // Gather all meshes under these roots
+    const meshes = [];
+    nodes.forEach(n => n.getChildMeshes ? meshes.push(...n.getChildMeshes()) : null);
+    if (meshes.length === 0) return;
+    let min = new BABYLON.Vector3(Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE);
+    let max = new BABYLON.Vector3(Number.MIN_VALUE, Number.MIN_VALUE, Number.MIN_VALUE);
+    meshes.forEach(m => {
+      const b = m.getBoundingInfo().boundingBox;
+      min = BABYLON.Vector3.Minimize(min, b.minimumWorld);
+      max = BABYLON.Vector3.Maximize(max, b.maximumWorld);
+    });
+    const center = min.add(max).scale(0.5);
+    const radius = max.subtract(min).length() * 0.5;
+    camera.setTarget(center);
+    camera.radius = Math.max(radius * 2.2, 0.6);
+  }
+
+  // Optional preview: instantiate once at origin so you know the scale
+  const previewInst = container.instantiateModelsToScene(name => "preview_" + name);
+  const previewRoot = new BABYLON.TransformNode("preview_root", scene);
+  previewInst.rootNodes.forEach(n => n.parent = previewRoot);
+  previewRoot.scaling.scaleInPlace(0.5);
+  previewRoot.position.y = 0.02;
+  frameNodes(previewInst.rootNodes);
+
+  let lastPlaced = null;
+
+  // Spawner using instantiateModelsToScene (works for any GLB structure)
+  function spawnAt(position){
+    const inst = container.instantiateModelsToScene(name => "spawn_" + BABYLON.Tools.RandomId() + "_" + name);
+    // Group roots under one parent we control
+    const group = new BABYLON.TransformNode("group_" + BABYLON.Tools.RandomId(), scene);
+    inst.rootNodes.forEach(n => n.parent = group);
+    group.scaling.scaleInPlace(0.5);
+    group.position.copyFrom(position);
+
+    // Sit on ground: lift by bbox offset
+    const meshes = group.getChildMeshes();
+    if (meshes.length) {
+      const bbMinY = Math.min(...meshes.map(m => m.getBoundingInfo().boundingBox.minimumWorld.y));
+      group.position.y += (group.position.y - bbMinY) + 0.01;
+    }
+
+    lastPlaced = group;
+    return group;
+  }
+
+  // Mouse move -> ray to ground
+  scene.onPointerMove = function(){
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => mesh === ground);
+    if (pick && pick.hit) { reticle.isVisible = true; reticle.position.copyFrom(pick.pickedPoint); }
+    else { reticle.isVisible = false; }
+  };
+
+  // Left click: place at reticle
+  scene.onPointerDown = function (evt) {
+    if (evt.button !== 0) return;
+    if (!reticle.isVisible) return;
+    spawnAt(reticle.position);
+  };
+
+  // Keyboard move (simulate thumbstick)
+  const keys = { w:false, a:false, s:false, d:false, up:false, down:false, left:false, right:false };
+  window.addEventListener("keydown", (e)=>{
+    const k = e.key.toLowerCase();
+    if (k in keys) keys[k] = true;
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) keys[e.key.replace("Arrow","").toLowerCase()] = true;
+  });
+  window.addEventListener("keyup", (e)=>{
+    const k = e.key.toLowerCase();
+    if (k in keys) keys[k] = false;
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) keys[e.key.replace("Arrow","").toLowerCase()] = false;
+  });
+
+  scene.onBeforeRenderObservable.add(()=>{
+    if (!lastPlaced) return;
+    const dt = scene.getEngine().getDeltaTime() / 1000;
+    const speed = 0.8;
+    const forward = (keys.w || keys.up) ? 1 : (keys.s || keys.down) ? -1 : 0;
+    const right   = (keys.d || keys.right) ? 1 : (keys.a || keys.left) ? -1 : 0;
+    lastPlaced.position.x += right * speed * dt;
+    lastPlaced.position.z += -forward * speed * dt;
+  });
+
+  return scene;
+};
